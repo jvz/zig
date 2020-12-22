@@ -28,6 +28,7 @@ const stage1 = @import("stage1.zig");
 const translate_c = @import("translate_c.zig");
 const ThreadPool = @import("ThreadPool.zig");
 const WaitGroup = @import("WaitGroup.zig");
+const libtsan = @import("libtsan.zig");
 
 /// General-purpose allocator. Used for both temporary and long-term storage.
 gpa: *Allocator,
@@ -92,6 +93,9 @@ libcxxabi_static_lib: ?CRTFile = null,
 /// Populated when we build the libunwind static library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
 libunwind_static_lib: ?CRTFile = null,
+/// Populated when we build the TSAN static library. A Job to build this is placed in the queue
+/// and resolved before calling linker.flush().
+tsan_static_lib: ?CRTFile = null,
 /// Populated when we build the libssp static library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
 libssp_static_lib: ?CRTFile = null,
@@ -174,6 +178,7 @@ const Job = union(enum) {
     libunwind: void,
     libcxx: void,
     libcxxabi: void,
+    libtsan: void,
     libssp: void,
     compiler_rt_lib: void,
     compiler_rt_obj: void,
@@ -383,6 +388,7 @@ pub const InitOptions = struct {
     want_sanitize_c: ?bool = null,
     want_stack_check: ?bool = null,
     want_valgrind: ?bool = null,
+    want_tsan: ?bool = null,
     want_compiler_rt: ?bool = null,
     use_llvm: ?bool = null,
     use_lld: ?bool = null,
@@ -639,13 +645,15 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             options.libc_installation,
         );
 
+        const tsan = options.want_tsan orelse false;
+
         const must_pie = target_util.requiresPIE(options.target);
-        const pie = if (options.want_pie) |explicit| pie: {
+        const pie: bool = if (options.want_pie) |explicit| pie: {
             if (!explicit and must_pie) {
                 return error.TargetRequiresPIE;
             }
             break :pie explicit;
-        } else must_pie;
+        } else must_pie or tsan;
 
         const must_pic: bool = b: {
             if (target_util.requiresPIC(options.target, link_libc))
@@ -746,6 +754,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
         cache.hash.add(ofmt);
         cache.hash.add(pic);
         cache.hash.add(pie);
+        cache.hash.add(tsan);
         cache.hash.add(stack_check);
         cache.hash.add(link_mode);
         cache.hash.add(options.function_sections);
@@ -952,6 +961,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             .pic = pic,
             .pie = pie,
             .valgrind = valgrind,
+            .tsan = tsan,
             .stack_check = stack_check,
             .single_threaded = single_threaded,
             .verbose_link = options.verbose_link,
@@ -1087,6 +1097,9 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
         {
             try comp.work_queue.writeItem(.libcxx);
             try comp.work_queue.writeItem(.libcxxabi);
+        }
+        if (build_options.have_llvm and comp.bin_file.options.tsan) {
+            try comp.work_queue.writeItem(.libtsan);
         }
 
         // The `is_stage1` condition is here only because stage2 cannot yet build compiler-rt.
@@ -1517,6 +1530,12 @@ pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemor
             libcxx.buildLibCXXABI(self) catch |err| {
                 // TODO Expose this as a normal compile error rather than crashing here.
                 fatal("unable to build libcxxabi: {}", .{@errorName(err)});
+            };
+        },
+        .libtsan => {
+            libtsan.buildTsan(self) catch |err| {
+                // TODO Expose this as a normal compile error rather than crashing here.
+                fatal("unable to build TSAN library: {}", .{@errorName(err)});
             };
         },
         .compiler_rt_lib => {
@@ -2000,6 +2019,10 @@ pub fn addCCArgs(
 
     if (comp.bin_file.options.function_sections) {
         try argv.append("-ffunction-sections");
+    }
+
+    if (comp.bin_file.options.tsan) {
+        try argv.append("-fsanitize=thread");
     }
 
     try argv.ensureCapacity(argv.items.len + comp.bin_file.options.framework_dirs.len * 2);
@@ -2837,6 +2860,7 @@ fn buildOutputFromZig(
         .want_sanitize_c = false,
         .want_stack_check = false,
         .want_valgrind = false,
+        .want_tsan = false,
         .want_pic = comp.bin_file.options.pic,
         .want_pie = comp.bin_file.options.pie,
         .emit_h = null,
@@ -3062,6 +3086,7 @@ fn updateStage1Module(comp: *Compilation, main_progress_node: *std.Progress.Node
         .dll_export_fns = comp.bin_file.options.dll_export_fns,
         .link_mode_dynamic = comp.bin_file.options.link_mode == .Dynamic,
         .valgrind_enabled = comp.bin_file.options.valgrind,
+        .tsan_enabled = comp.bin_file.options.tsan,
         .function_sections = comp.bin_file.options.function_sections,
         .enable_stack_probing = comp.bin_file.options.stack_check,
         .enable_time_report = comp.time_report,
@@ -3209,6 +3234,7 @@ pub fn build_crt_file(
         .want_sanitize_c = false,
         .want_stack_check = false,
         .want_valgrind = false,
+        .want_tsan = false,
         .want_pic = comp.bin_file.options.pic,
         .want_pie = comp.bin_file.options.pie,
         .emit_h = null,
